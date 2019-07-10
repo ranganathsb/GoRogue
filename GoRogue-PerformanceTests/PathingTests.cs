@@ -1,55 +1,101 @@
 ﻿using GoRogue;
+using GoRogue.MapGeneration;
 using GoRogue.MapViews;
 using GoRogue.Pathing;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
-using Generators = GoRogue.MapGeneration.Generators;
 
 namespace GoRogue_PerformanceTests
 {
-    public static class PathingTests
-    {
-        private static Coord END = Coord.Get(17, 14);
-        private static Coord START = Coord.Get(1, 2);
+	public static class PathingTests
+	{
+		//private static Coord END = new Coord(17, 14);
+		private static Coord START = new Coord(1, 2);
+		private static Coord END = new Coord(490,490);
 
-        public static TimeSpan TimeForAStar(int mapWidth, int mapHeight, int iterations)
-        {
-            var s = new Stopwatch();
+		public static TimeSpan TimeForAStar(int mapWidth, int mapHeight, int iterations)
+		{
+			var s = new Stopwatch();
 
-            var map = new ArrayMap<bool>(mapWidth, mapHeight);
-            Generators.RectangleMapGenerator.Generate(map);
+			var map = new ArrayMap<bool>(mapWidth, mapHeight);
+			QuickGenerators.GenerateRectangleMap(map);
 
-            var pather = new AStar(map, Distance.CHEBYSHEV);
-            var path = pather.ShortestPath(START, END); // Cache warmup
+			var pather = new AStar(map, Distance.CHEBYSHEV);
+			var path = pather.ShortestPath(START, END); // Cache warmup
 
-            s.Start();
-            for (int i = 0; i < iterations; i++)
-                path = pather.ShortestPath(START, END);
-            s.Stop();
+			s.Start();
+			for (int i = 0; i < iterations; i++)
+				path = pather.ShortestPath(START, END);
+			s.Stop();
 
-            return s.Elapsed;
-        }
+			return s.Elapsed;
+		}
 
-        public static TimeSpan TimeForSingleSourceDijkstra(int mapWidth, int mapHeight, int iterations)
-        {
-            Stopwatch s = new Stopwatch();
+		public static TimeSpan TimeForFastAStar(int mapWidth, int mapHeight, int iterations)
+		{
+			var s = new Stopwatch();
 
-            var map = new ArrayMap<bool>(mapWidth, mapHeight);
-            Generators.RectangleMapGenerator.Generate(map);
+			var map = new ArrayMap<bool>(mapWidth, mapHeight);
+			QuickGenerators.GenerateRectangleMap(map);
 
-            DijkstraMap dMap = new DijkstraMap(map);
+			var pather = new FastAStar(map, Distance.CHEBYSHEV);
+			var path = pather.ShortestPath(START, END); // Cache warmup
 
-            dMap.AddGoal(5, 5);
+			s.Start();
+			for (int i = 0; i < iterations; i++)
+				path = pather.ShortestPath(START, END);
+			s.Stop();
 
-            dMap.Calculate(); // warm-up value
+			return s.Elapsed;
+		}
 
-            s.Start();
-            for (int i = 0; i < iterations; i++)
-                dMap.Calculate();
+		public static TimeSpan TimeForFleeMap(IMapView<bool> map, IEnumerable<Coord> goals, int iterations)
+		{
+			Stopwatch s = new Stopwatch();
 
-            s.Stop();
+			var mapGoals = createGoalStateMap(map, goals);
+			var mapBuilder = new GoalMap(mapGoals, Distance.CHEBYSHEV);
+			var fleeMap = new FleeMap(mapBuilder);
 
-            return s.Elapsed;
-        }
-    }
+			mapBuilder.Update();
+
+			s.Start();
+			for (int i = 0; i < iterations; i++)
+				mapBuilder.Update();
+			s.Stop();
+
+			return s.Elapsed;
+		}
+
+		public static TimeSpan TimeForGoalMap(IMapView<bool> map, IEnumerable<Coord> goals, int iterations)
+		{
+			Stopwatch s = new Stopwatch();
+
+			var mapGoals = createGoalStateMap(map, goals);
+			var mapBuilder = new GoalMap(mapGoals, Distance.CHEBYSHEV);
+
+			mapBuilder.Update();
+
+			s.Start();
+			for (int i = 0; i < iterations; i++)
+				mapBuilder.Update();
+			s.Stop();
+
+			return s.Elapsed;
+		}
+
+		private static IMapView<GoalState> createGoalStateMap(IMapView<bool> walkabilityMap, IEnumerable<Coord> goals)
+		{
+			var mapGoals = new ArrayMap<GoalState>(walkabilityMap.Width, walkabilityMap.Height);
+			for (int x = 0; x < walkabilityMap.Width; x++)
+				for (int y = 0; y < walkabilityMap.Height; y++)
+					mapGoals[x, y] = walkabilityMap[x, y] ? GoalState.Clear : GoalState.Obstacle;
+
+			foreach (var goal in goals)
+				mapGoals[goal] = GoalState.Goal;
+
+			return mapGoals;
+		}
+	}
 }

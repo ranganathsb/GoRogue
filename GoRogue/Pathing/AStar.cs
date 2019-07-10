@@ -1,418 +1,489 @@
-﻿using Priority_Queue;
+﻿using GoRogue;
+using GoRogue.MapViews;
+using Priority_Queue;
 using System;
 using System.Collections.Generic;
-using GoRogue.MapViews;
 
 namespace GoRogue.Pathing
 {
-    /// <summary>
-    /// Implements basic AStar pathing. Distance specified determins the heuristic and connectivity
-    /// (4-way vs. 8-way) assumed.
-    /// </summary>
-    public class AStar
-    {
-        private Distance _distanceMeasurement;
+	/// <summary>
+	/// Implements an optimized AStar pathfinding algorithm. Optionally supports custom heuristics, and custom weights for each tile.
+	/// </summary>
+	/// <remarks>
+	/// Like most GoRogue algorithms, AStar takes as a construction parameter an IMapView representing the map. 
+	/// Specifically, it takes an <see cref="IMapView{Boolean}"/>, where true indicates that a tile should be
+	/// considered walkable, and false indicates that a tile should be considered impassable.
+	/// 
+	/// For details on the map view system in general, see <see cref="IMapView{T}"/>.  As well, there is an article
+	/// explaining the map view system at the GoRogue documentation page
+	/// <a href="https://chris3606.github.io/GoRogue/articles">here</a>
+	/// 
+	/// If truly shortest paths are not strictly necessary, you may want to consider <see cref="FastAStar"/> instead.
+	/// </remarks>
+	public class AStar
+	{
+		// Node objects used under the hood for the priority queue
+		private AStarNode[] nodes;
 
-        private Func<int, int, IEnumerable<Direction>> neighborFunc;
+		// Stored as seperate array for performance reasons since it must be cleared at each run
+		private bool[] closed;
 
-        // Used to calculate neighbors of a given cell
-        private AStarNode[] nodes;
+		// Width and of the walkability map at the last path -- used to determine whether
+		// reallocation of nodes array is necessary
+		private int cachedHeight;
+		private int cachedWidth;
 
-        private int nodesHeight;
+		// Priority queue of the open nodes.
+		private FastPriorityQueue<AStarNode> openNodes;
 
-        // Width and of the walkability map at the last path -- used to determine whether
-        // reallocation of nodes array is necessary
-        private int nodesWidth;
+		/// <summary>
+		/// The distance calculation being used to determine distance between points. <see cref="Distance.MANHATTAN"/>
+		/// implies 4-way connectivity, while <see cref="Distance.CHEBYSHEV"/> or <see cref="Distance.EUCLIDEAN"/> imply
+		/// 8-way connectivity for the purpose of determining adjacent coordinates.
+		/// </summary>
+		public Distance DistanceMeasurement { get; set; } // Has to be a property for default heuristic to update properly when this is changed
 
-        // Node objects used under the hood for the priority queue
-        private FastPriorityQueue<AStarNode> openNodes;
+		/// <summary>
+		/// The map view being used to determine whether or not each tile is walkable.
+		/// </summary>
+		public IMapView<bool> WalkabilityMap { get; private set; }
 
-        // Priority queue of the open nodes.
-        /// <summary>
-        /// Constructor.
-        /// </summary>
-        /// <param name="walkabilityMap">
-        /// Map used to determine whether or not a given location can be traversed -- true indicates
-        /// walkable, false unwalkable.
-        /// </param>
-        /// <param name="distanceMeasurement">
-        /// Distance measurement used to determine the method of measuring distance between two
-        /// points, the heuristic AStar uses when pathfinding, and whether locations are connected in
-        /// a 4-way or 8-way manner.
-        /// </param>
-        public AStar(IMapView<bool> walkabilityMap, Distance distanceMeasurement)
-        {
-            WalkabilityMap = walkabilityMap;
-            DistanceMeasurement = distanceMeasurement;
+		private Func<Coord, Coord, double> _heuristic;
+		/// <summary>
+		/// The heuristic used to estimate distance from nodes to the end point.  If unspecified or specified as null,
+		/// it defaults to using the distance calculation specified by <see cref="DistanceMeasurement"/>, with a safe/efficient
+		/// tie-breaking multiplier added on.
+		/// </summary>
+		public Func<Coord, Coord, double> Heuristic
+		{
+			get => _heuristic;
 
-            int maxSize = walkabilityMap.Width * walkabilityMap.Height;
-            nodes = new AStarNode[maxSize];
-            for (int i = 0; i < maxSize; i++)
-                nodes[i] = new AStarNode(Coord.ToCoord(i, walkabilityMap.Width), null);
-            nodesWidth = walkabilityMap.Width;
-            nodesHeight = walkabilityMap.Height;
+			set
+			{
+				_heuristic = value ?? ((c1, c2) => DistanceMeasurement.Calculate(c1, c2) + (Coord.EuclideanDistanceMagnitude(c1, c2) * MaxEuclideanMultiplier));
+			}
+		}
 
-            openNodes = new FastPriorityQueue<AStarNode>(maxSize);
-        }
+		/// <summary>
+		/// Weights given to each tile.  The weight is multiplied by the cost of a tile, so a tile with weight 2 is twice as hard to
+		/// enter as a tile with weight 1.  If unspecified or specified as null, all tiles have weight 1.
+		/// </summary>
+		public IMapView<double> Weights { get; }
 
-        /// <summary>
-        /// The distance calculation being used to determine distance between points. MANHATTAN
-        /// implies 4-way connectivity, while CHEBYSHEV or EUCLIDEAN imply 8-way connectivity for the
-        /// purpose of determining adjacent coordinates.
-        /// </summary>
-        public Distance DistanceMeasurement
-        {
-            get => _distanceMeasurement;
-            set
-            {
-                _distanceMeasurement = value;
-                if (_distanceMeasurement == Distance.MANHATTAN)
-                    neighborFunc = cardinalNeighbors;
-                else
-                    neighborFunc = neighbors;
-            }
-        }
+		// NOTE: This HAS to be a property instead of a field for default heuristic to update properly when this is changed
+		/// <summary>
+		/// Multiplier that is used in the tiebreaking/smoothing element of the default heuristic. This value is based on the
+		/// maximum possible <see cref="Coord.EuclideanDistanceMagnitude(Coord, Coord)"/> between two points on the map.
+		/// 
+		/// Typically you dont' need this value unless you're creating a custom heuristic an introducing the same
+		/// tiebreaking/smoothing element as the default heuristic.
+		/// </summary>
+		public double MaxEuclideanMultiplier { get; private set; }
 
-        /// <summary>
-        /// The map being used as the source for whether or not each tile is walkable.
-        /// </summary>
-        public IMapView<bool> WalkabilityMap { get; private set; }
+		/// <summary>
+		/// The minimum value that is allowed to occur in the <see cref="Weights"/> map view.  This value is only used with the default heuristic
+		/// for AStar and <see cref="FastAStar"/>, so if a custom heuristic is used, the value is also ignored.  Must be greater than 0.0 and less
+		/// than or equal to the minimum value in the <see cref="Weights"/> map view.  Defaults to 1.0 in cases where the default heuristic is used.
+		/// </summary>
+		public double MinimumWeight;
 
-        /// <summary>
-        /// Finds the shortest path between the two specified points.
-        /// </summary>
-        /// <remarks>
-        /// Returns null if there is no path between the specified points. Will still return an
-        /// appropriate path object if the start point is equal to the end point.
-        /// </remarks>
-        /// <param name="start">The starting point of the path.</param>
-        /// <param name="end">The ending point of the path.</param>
-        /// <returns>The shortest path between the two points, or null if no valid path exists.</returns>
-        public Path ShortestPath(Coord start, Coord end)
-        {
-            // Don't waste initialization time if there is definately no path
-            if (!WalkabilityMap[start] || !WalkabilityMap[end])
-                return null; // There is no path
+		private double _cachedMinWeight;
 
-            // If the path is simply the start, don't bother with graph initialization and such
-            if (start == end)
-            {
-                var retVal = new List<Coord>();
-                retVal.Add(start);
-                return new Path(retVal);
-            }
+		/// <summary>
+		/// Constructor.  Uses a default heuristic corresponding to the distance calculation given, along with a safe/efficient
+		/// tiebreaking/smoothing element which will produce guaranteed shortest paths.
+		/// </summary>
+		/// <param name="walkabilityMap">Map view used to deterine whether or not each location can be traversed -- true indicates a tile can be traversed,
+		/// and false indicates it cannot.</param>
+		/// <param name="distanceMeasurement">Distance calculation used to determine whether 4-way or 8-way connectivity is used, and to determine
+		/// how to calculate the distance between points.</param>
+		public AStar(IMapView<bool> walkabilityMap, Distance distanceMeasurement)
+			: this(walkabilityMap, distanceMeasurement, null, null, 1.0) { }
 
-            // Clear nodes to beginning state
-            if (nodesWidth != WalkabilityMap.Width || nodesHeight != WalkabilityMap.Height)
-            {
-                int length = WalkabilityMap.Width * WalkabilityMap.Height;
-                nodes = new AStarNode[length];
-                openNodes = new FastPriorityQueue<AStarNode>(length);
-                for (int i = 0; i < length; i++)
-                    nodes[i] = new AStarNode(Coord.ToCoord(i, WalkabilityMap.Width), null);
+		/// <summary>
+		/// Constructor.
+		/// </summary>
+		/// <param name="walkabilityMap">Map view used to deterine whether or not each location can be traversed -- true indicates a tile can be traversed,
+		/// and false indicates it cannot.</param>
+		/// <param name="distanceMeasurement">Distance calculation used to determine whether 4-way or 8-way connectivity is used, and to determine
+		/// how to calculate the distance between points.</param>
+		/// <param name="heuristic">Function used to estimate the distance between two given points.</param>
+		public AStar(IMapView<bool> walkabilityMap, Distance distanceMeasurement, Func<Coord, Coord, double> heuristic)
+			: this(walkabilityMap, distanceMeasurement, heuristic, null, -1.0) { }
 
-                nodesWidth = WalkabilityMap.Width;
-                nodesHeight = WalkabilityMap.Height;
-            }
-            else
-            {
-                foreach (var node in nodes)
-                {
-                    node.Parent = null;
-                    node.Closed = false;
-                    node.F = node.G = float.MaxValue;
-                }
-            }
+		/// <summary>
+		/// Constructor.  Uses a default heuristic corresponding to the distance calculation given, along with a safe/efficient
+		/// tiebreaking/smoothing element which will produce guaranteed shortest paths, provided <paramref name="minimumWeight"/> is correct.
+		/// </summary>
+		/// <param name="walkabilityMap">Map view used to deterine whether or not each location can be traversed -- true indicates a tile can be traversed,
+		/// and false indicates it cannot.</param>
+		/// <param name="distanceMeasurement">Distance calculation used to determine whether 4-way or 8-way connectivity is used, and to determine
+		/// how to calculate the distance between points.</param>
+		/// <param name="weights">A map view indicating the weights of each location (see <see cref="Weights"/>.</param>
+		/// <param name="minimumWeight">The minimum value that will be present in <paramref name="weights"/>.  It must be greater than 0.0 and
+		/// must be less than or equal to the minimum value present in the weights view -- the algorithm may not produce truly shortest paths if
+		/// this condition is not met.  If this minimum changes after construction, it may be updated via the <see cref="AStar.MinimumWeight"/> property.</param>
+		public AStar(IMapView<bool> walkabilityMap, Distance distanceMeasurement, IMapView<double> weights, double minimumWeight)
+			: this(walkabilityMap, distanceMeasurement, null, weights, minimumWeight) { }
 
-            var result = new List<Coord>();
-            int index = start.ToIndex(WalkabilityMap.Width);
-            nodes[index].G = 0;
-            nodes[index].F = (float)_distanceMeasurement.Calculate(start, end); // Completely heuristic for first node
-            openNodes.Enqueue(nodes[index], nodes[index].F);
+		/// <summary>
+		/// Constructor.
+		/// </summary>
+		/// <param name="walkabilityMap">Map view used to deterine whether or not each location can be traversed -- true indicates a tile can be traversed,
+		/// and false indicates it cannot.</param>
+		/// <param name="distanceMeasurement">Distance calculation used to determine whether 4-way or 8-way connectivity is used, and to determine
+		/// how to calculate the distance between points.</param>
+		/// <param name="heuristic">Function used to estimate the distance between two given points.</param>
+		/// <param name="weights">A map view indicating the weights of each location (see <see cref="Weights"/>.</param>
+		public AStar(IMapView<bool> walkabilityMap, Distance distanceMeasurement, Func<Coord, Coord, double> heuristic, IMapView<double> weights)
+			: this(walkabilityMap, distanceMeasurement, heuristic, weights, -1.0) { }
 
-            while (openNodes.Count != 0)
-            {
-                var current = openNodes.Dequeue();
-                current.Closed = true; // We are evaluating this node, no need for it to ever end up in open nodes queue again
-                if (current.Position == end) // We found the end, cleanup and return the path
-                {
-                    openNodes.Clear();
+		// Private constructor that does work of others
+		private AStar(IMapView<bool> walkabilityMap, Distance distanceMeasurement, Func<Coord, Coord, double> heuristic = null, IMapView<double> weights = null, double minimumWeight = 1.0)
+		{
+			Weights = weights;
 
-                    do
-                    {
-                        result.Add(current.Position);
-                        current = current.Parent;
-                    } while (current != null);
+			WalkabilityMap = walkabilityMap;
+			DistanceMeasurement = distanceMeasurement;
+			MinimumWeight = minimumWeight;
+			_cachedMinWeight = minimumWeight;
+			MaxEuclideanMultiplier = MinimumWeight / (Coord.EuclideanDistanceMagnitude(0, 0, WalkabilityMap.Width, WalkabilityMap.Height));
 
-                    return new Path(result);
-                }
+			Heuristic = heuristic;
 
-                foreach (var dir in neighborFunc(end.X - current.Position.X, end.Y - current.Position.Y))
-                {
-                    Coord neighborPos = current.Position + dir;
+			int maxSize = walkabilityMap.Width * walkabilityMap.Height;
+			nodes = new AStarNode[maxSize];
+			closed = new bool[maxSize];
+			cachedWidth = walkabilityMap.Width;
+			cachedHeight = walkabilityMap.Height;
 
-                    if (!WalkabilityMap[neighborPos]) // Not part of walkable node "graph", ignore
-                        continue;
+			openNodes = new FastPriorityQueue<AStarNode>(maxSize);
+		}
 
-                    // Not a valid map position, ignore
-                    if (neighborPos.X < 0 || neighborPos.Y < 0 || neighborPos.X >= WalkabilityMap.Width || neighborPos.Y >= WalkabilityMap.Height)
-                        continue;
+		/// <summary>
+		/// Finds the shortest path between the two specified points.
+		/// </summary>
+		/// <remarks>
+		/// Returns <see langword="null"/> if there is no path between the specified points. Will still return an
+		/// appropriate path object if the start point is equal to the end point.
+		/// </remarks>
+		/// <param name="start">The starting point of the path.</param>
+		/// <param name="end">The ending point of the path.</param>
+		/// <param name="assumeEndpointsWalkable">
+		/// Whether or not to assume the start and end points are walkable, regardless of what the
+		/// <see cref="WalkabilityMap"/> reports. Defaults to <see langword="true"/>.
+		/// </param>
+		/// <returns>The shortest path between the two points, or <see langword="null"/> if no valid path exists.</returns>
+		public Path ShortestPath(Coord start, Coord end, bool assumeEndpointsWalkable = true)
+		{
+			// Don't waste initialization time if there is definately no path
+			if (!assumeEndpointsWalkable && (!WalkabilityMap[start] || !WalkabilityMap[end]))
+				return null; // There is no path
 
-                    int neighborIndex = neighborPos.ToIndex(WalkabilityMap.Width);
-                    var neighbor = nodes[neighborIndex];
+			// If the path is simply the start, don't bother with graph initialization and such
+			if (start == end)
+			{
+				var retVal = new List<Coord> { start };
+				return new Path(retVal);
+			}
 
-                    if (neighbor.Closed) // This neighbor has already been evaluated at shortest possible path, don't re-add
-                        continue;
+			// Update min weight if it has changed
+			if (MinimumWeight != _cachedMinWeight)
+			{
+				_cachedMinWeight = MinimumWeight;
+				MaxEuclideanMultiplier = MinimumWeight / (Coord.EuclideanDistanceMagnitude(0, 0, WalkabilityMap.Width, WalkabilityMap.Height));
+			}
+			// Update width/height dependent values if map width/height has changed
+			if (cachedWidth != WalkabilityMap.Width || cachedHeight != WalkabilityMap.Height)
+			{
+				int length = WalkabilityMap.Width * WalkabilityMap.Height;
+				nodes = new AStarNode[length];
+				closed = new bool[length];
+				openNodes = new FastPriorityQueue<AStarNode>(length);
 
-                    float newDistance = current.G + (float)_distanceMeasurement.Calculate(current.Position, neighbor.Position);
-                    if (newDistance >= neighbor.G) // Not a better path
-                        continue;
+				cachedWidth = WalkabilityMap.Width;
+				cachedHeight = WalkabilityMap.Height;
 
-                    // We found a best path, so record and update
-                    neighbor.Parent = current;
-                    neighbor.G = newDistance; // (Known) distance to this node via shortest path
-                    neighbor.F = newDistance + (float)_distanceMeasurement.Calculate(neighbor.Position, end); // Heuristic distance to end (priority in queue)
-                    // If it's already in the queue, update priority to new F
-                    if (openNodes.Contains(neighbor))
-                        openNodes.UpdatePriority(neighbor, neighbor.F);
-                    else // Otherwise, add it with proper priority
-                        openNodes.Enqueue(neighbor, neighbor.F);
-                }
-            }
+				MaxEuclideanMultiplier = MinimumWeight / (Coord.EuclideanDistanceMagnitude(0, 0, WalkabilityMap.Width, WalkabilityMap.Height));
+			}
+			else
+				Array.Clear(closed, 0, closed.Length);
 
-            openNodes.Clear();
-            return null; // No path found
-        }
+			var result = new List<Coord>();
+			int index = start.ToIndex(WalkabilityMap.Width);
 
-        /// <summary>
-        /// Finds the shortest path between the two specified points.
-        /// </summary>
-        /// <remarks>
-        /// Returns null if there is no path between the specified points. Will still return an
-        /// appropriate path object if the start point is equal to the end point.
-        /// </remarks>
-        /// <param name="startX">The x-coordinate of the starting point of the path.</param>
-        /// <param name="startY">The y-coordinate of the starting point of the path.</param>
-        /// <param name="endX">The x-coordinate of the ending point of the path.</param>
-        /// <param name="endY">The y-coordinate of the ending point of the path.</param>
-        /// <returns>The shortest path between the two points, or null if no valid path exists.</returns>
-        public Path ShortestPath(int startX, int startY, int endX, int endY) => ShortestPath(Coord.Get(startX, startY), Coord.Get(endX, endY));
+			if (nodes[index] == null)
+				nodes[index] = new AStarNode(start, null);
 
-        // These neighbor functions are special in that they return (approximately) the closest
-        // directions to the end goal first. This is intended to "prioritize" more direct-looking
-        // paths, in the case that one or more paths are equally short
-        private static IEnumerable<Direction> cardinalNeighbors(int dx, int dy)
-        {
-            Direction left, right;
-            // Intentional inversion of dx and dy sign, because of the order in which our priority
-            // queue returns values (we want the direction that we ideally use, eg. the one closest
-            // to the specified line, to be last-in, not first-in)
-            left = right = Direction.GetCardinalDirection(-dx, -dy);
-            yield return right; // Return first direction
+			nodes[index].G = 0;
+			nodes[index].F = (float)Heuristic(start, end); // Completely heuristic for first node
+			openNodes.Enqueue(nodes[index], nodes[index].F);
 
-            left -= 2;
-            right += 2;
-            yield return left;
-            yield return right;
+			while (openNodes.Count != 0)
+			{
+				var current = openNodes.Dequeue();
+				var currentIndex = current.Position.ToIndex(WalkabilityMap.Width);
+				closed[currentIndex] = true;
 
-            // Return last direction
-            right += 2;
-            yield return right;
-        }
+				if (current.Position == end) // We found the end, cleanup and return the path
+				{
+					openNodes.Clear();
 
-        private static IEnumerable<Direction> neighbors(int dx, int dy)
-        {
-            Direction left, right;
-            // Intentional inversion of dx and dy sign, because of the order in which our priority
-            // queue returns values
-            left = right = Direction.GetDirection(-dx, -dy);
-            yield return right; // Return first direction
+					do
+					{
+						result.Add(current.Position);
+						current = current.Parent;
+					} while (current.Position != start);
 
-            for (int i = 0; i < 3; i++)
-            {
-                left--;
-                right++;
+					result.Add(start);
+					return new Path(result);
+				}
 
-                yield return left;
-                yield return right;
-            }
+				foreach (var dir in ((AdjacencyRule)DistanceMeasurement).DirectionsOfNeighbors())
+				{
+					Coord neighborPos = current.Position + dir;
 
-            // Return last direction
-            right++;
-            yield return right;
-        }
-    }
+					// Not a valid map position, ignore
+					if (neighborPos.X < 0 || neighborPos.Y < 0 || neighborPos.X >= WalkabilityMap.Width || neighborPos.Y >= WalkabilityMap.Height)
+						continue;
 
-    /// <summary>
-    /// Encapsulates a path as returned by pathfinding algorithms like AStar.
-    /// </summary>
-    /// <remarks>
-    /// Provides various functions to iterate through/access steps of the path, as well as
-    /// constant-time reversing functionality.
-    /// </remarks>
-    public class Path
-    {
-        private IReadOnlyList<Coord> _steps;
-        private bool inOriginalOrder;
+					if (!checkWalkability(neighborPos, start, end, assumeEndpointsWalkable)) // Not part of walkable node "graph", ignore
+						continue;
 
-        /// <summary>
-        /// Creates a copy of the path, optionally reversing the path as it does so.
-        /// </summary>
-        /// <remarks>Reversing is an O(1) operation, since it does not modify the list.</remarks>
-        /// <param name="pathToCopy">The path to copy.</param>
-        /// <param name="reverse">Whether or not to reverse the path. Defaults to false.</param>
-        public Path(Path pathToCopy, bool reverse = false)
-        {
-            _steps = pathToCopy._steps;
-            inOriginalOrder = (reverse ? !pathToCopy.inOriginalOrder : pathToCopy.inOriginalOrder);
-        }
+					int neighborIndex = neighborPos.ToIndex(WalkabilityMap.Width);
+					var neighbor = nodes[neighborIndex];
 
-        // Create based on internal list
-        internal Path(IReadOnlyList<Coord> steps)
-        {
-            _steps = steps;
-            inOriginalOrder = true;
-        }
+					var isNeighborOpen = IsOpen(neighbor, openNodes);
 
-        /// <summary>
-        /// Ending point of the path.
-        /// </summary>
-        public Coord End
-        {
-            get
-            {
-                if (inOriginalOrder)
-                    return _steps[0];
+					if (neighbor == null) // Can't be closed because never visited
+						nodes[neighborIndex] = neighbor = new AStarNode(neighborPos, null);
+					else if (closed[neighborIndex]) // This neighbor has already been evaluated at shortest possible path, don't re-add
+						continue;
 
-                return _steps[_steps.Count - 1];
-            }
-        }
+					float newDistance = current.G + (float)DistanceMeasurement.Calculate(current.Position, neighbor.Position) * (float)(Weights== null ? 1.0 : Weights[neighbor.Position]);
+					if (isNeighborOpen && newDistance >= neighbor.G) // Not a better path
+						continue;
 
-        /// <summary>
-        /// The length of the path, NOT including the starting point.
-        /// </summary>
-        public int Length { get => _steps.Count - 1; }
+					// We found a best path, so record and update
+					neighbor.Parent = current;
+					neighbor.G = newDistance; // (Known) distance to this node via shortest path
+					// Heuristic distance to end (priority in queue). If it's already in the queue, update priority to new F
+					neighbor.F = newDistance + (float)Heuristic(neighbor.Position, end);
 
-        /// <summary>
-        /// The length of the path, INCLUDING the starting point.
-        /// </summary>
-        public int LengthWithStart { get => _steps.Count; }
+					if (openNodes.Contains(neighbor))
+						openNodes.UpdatePriority(neighbor, neighbor.F);
+					else // Otherwise, add it with proper priority
+					{
+						openNodes.Enqueue(neighbor, neighbor.F);
+					}
+				}
+			}
 
-        /// <summary>
-        /// Starting point of the path.
-        /// </summary>
-        public Coord Start
-        {
-            get
-            {
-                if (inOriginalOrder)
-                    return _steps[_steps.Count - 1];
+			openNodes.Clear();
+			return null; // No path found
+		}
 
-                return _steps[0];
-            }
-        }
+		/// <summary>
+		/// Finds the shortest path between the two specified points.
+		/// </summary>
+		/// <remarks>
+		/// Returns <see langword="null"/> if there is no path between the specified points. Will still return an
+		/// appropriate path object if the start point is equal to the end point.
+		/// </remarks>
+		/// <param name="startX">The x-coordinate of the starting point of the path.</param>
+		/// <param name="startY">The y-coordinate of the starting point of the path.</param>
+		/// <param name="endX">The x-coordinate of the ending point of the path.</param>
+		/// <param name="endY">The y-coordinate of the ending point of the path.</param>
+		/// <param name="assumeEndpointsWalkable">
+		/// Whether or not to assume the start and end points are walkable, regardless of what the
+		/// <see cref="WalkabilityMap"/> reports. Defaults to <see langword="true"/>.
+		/// </param>
+		/// <returns>The shortest path between the two points, or <see langword="null"/> if no valid path exists.</returns>
+		public Path ShortestPath(int startX, int startY, int endX, int endY, bool assumeEndpointsWalkable = true)
+			=> ShortestPath(new Coord(startX, startY), new Coord(endX, endY), assumeEndpointsWalkable);
 
-        /// <summary>
-        /// The coordinates that constitute the path (in order), NOT including the starting point.
-        /// These are the coordinates something might walk along to follow a path.
-        /// </summary>
-        public IEnumerable<Coord> Steps
-        {
-            get
-            {
-                if (inOriginalOrder)
-                {
-                    for (int i = _steps.Count - 2; i >= 0; i--)
-                        yield return _steps[i];
-                }
-                else
-                {
-                    for (int i = 1; i < _steps.Count; i++)
-                        yield return _steps[i];
-                }
-            }
-        }
+		private static bool IsOpen(AStarNode node, FastPriorityQueue<AStarNode> openSet)
+		{
+			return node != null && openSet.Contains(node);
+		}
 
-        /// <summary>
-        /// The coordinates that constitute the path (in order), INCLUDING the starting point.
-        /// </summary>
-        public IEnumerable<Coord> StepsWithStart
-        {
-            get
-            {
-                if (inOriginalOrder)
-                {
-                    for (int i = _steps.Count - 1; i >= 0; i--)
-                        yield return _steps[i];
-                }
-                else
-                {
-                    for (int i = 0; i < _steps.Count; i++)
-                        yield return _steps[i];
-                }
-            }
-        }
+		private bool checkWalkability(Coord pos, Coord start, Coord end, bool assumeEndpointsWalkable)
+		{
+			if (!assumeEndpointsWalkable)
+				return WalkabilityMap[pos];
 
-        /// <summary>
-        /// Gets the nth step along the path, where 0 is the step AFTER the starting point.
-        /// </summary>
-        /// <param name="stepNum">The (array-like index) of the step to get.</param>
-        /// <returns>The coordinate consituting the step specified.</returns>
-        public Coord GetStep(int stepNum)
-        {
-            if (inOriginalOrder)
-                return _steps[(_steps.Count - 2) - stepNum];
+			return WalkabilityMap[pos] || pos == start || pos == end;
+		}
+	}
 
-            return _steps[stepNum + 1];
-        }
+	/// <summary>
+	/// Encapsulates a path as returned by pathfinding algorithms like AStar.
+	/// </summary>
+	/// <remarks>
+	/// Provides various functions to iterate through/access steps of the path, as well as
+	/// constant-time reversing functionality.
+	/// </remarks>
+	public class Path
+	{
+		private IReadOnlyList<Coord> _steps;
+		private bool inOriginalOrder;
 
-        /// <summary>
-        /// Gets the nth step along the path, where 0 IS the starting point.
-        /// </summary>
-        /// <param name="stepNum">The (array-like index) of the step to get.</param>
-        /// <returns>The coordinate consituting the step specified.</returns>
-        public Coord GetStepWithStart(int stepNum)
-        {
-            if (inOriginalOrder)
-                return _steps[(_steps.Count - 1) - stepNum];
+		/// <summary>
+		/// Creates a copy of the path, optionally reversing the path as it does so.
+		/// </summary>
+		/// <remarks>Reversing is an O(1) operation, since it does not modify the list.</remarks>
+		/// <param name="pathToCopy">The path to copy.</param>
+		/// <param name="reverse">Whether or not to reverse the path. Defaults to <see langword="false"/>.</param>
+		public Path(Path pathToCopy, bool reverse = false)
+		{
+			_steps = pathToCopy._steps;
+			inOriginalOrder = (reverse ? !pathToCopy.inOriginalOrder : pathToCopy.inOriginalOrder);
+		}
 
-            return _steps[stepNum];
-        }
+		// Create based on internal list
+		internal Path(IReadOnlyList<Coord> steps)
+		{
+			_steps = steps;
+			inOriginalOrder = true;
+		}
 
-        /// <summary>
-        /// Reverses the path, in constant time.
-        /// </summary>
-        public void Reverse() => inOriginalOrder = !inOriginalOrder;
+		/// <summary>
+		/// Ending point of the path.
+		/// </summary>
+		public Coord End
+		{
+			get
+			{
+				if (inOriginalOrder)
+					return _steps[0];
 
-        /// <summary>
-        /// Returns a string representation of all the steps in the path, including the start point, eg.
-        /// [(1, 2), (3, 4), (5, 6)].
-        /// </summary>
-        /// <returns>A string representation of all steps in the path, including the start.</returns>
-        public override string ToString() => StepsWithStart.ExtendToString();
-    }
+				return _steps[_steps.Count - 1];
+			}
+		}
 
-    // Node for AStar, stores all values and integrates with priority queue implementation
-    internal class AStarNode : FastPriorityQueueNode
-    {
-        public readonly Coord Position;
-        public bool Closed;
+		/// <summary>
+		/// The length of the path, NOT including the starting point.
+		/// </summary>
+		public int Length { get => _steps.Count - 1; }
 
-        // Whether or not the node has been closed
-        public float F;
+		/// <summary>
+		/// The length of the path, INCLUDING the starting point.
+		/// </summary>
+		public int LengthWithStart { get => _steps.Count; }
 
-        // (Partly estimated) distance to end point going thru this node
-        public float G;
+		/// <summary>
+		/// Starting point of the path.
+		/// </summary>
+		public Coord Start
+		{
+			get
+			{
+				if (inOriginalOrder)
+					return _steps[_steps.Count - 1];
 
-        public AStarNode Parent;
-        // (Known) distance from start to this node, by shortest known path
+				return _steps[0];
+			}
+		}
 
-        public AStarNode(Coord position, AStarNode parent = null)
-        {
-            Parent = parent;
-            Position = position;
-            Closed = false;
-            F = G = float.MaxValue;
-        }
-    }
+		/// <summary>
+		/// The coordinates that constitute the path (in order), NOT including the starting point.
+		/// These are the coordinates something might walk along to follow a path.
+		/// </summary>
+		public IEnumerable<Coord> Steps
+		{
+			get
+			{
+				if (inOriginalOrder)
+				{
+					for (int i = _steps.Count - 2; i >= 0; i--)
+						yield return _steps[i];
+				}
+				else
+				{
+					for (int i = 1; i < _steps.Count; i++)
+						yield return _steps[i];
+				}
+			}
+		}
+
+		/// <summary>
+		/// The coordinates that constitute the path (in order), INCLUDING the starting point.
+		/// </summary>
+		public IEnumerable<Coord> StepsWithStart
+		{
+			get
+			{
+				if (inOriginalOrder)
+				{
+					for (int i = _steps.Count - 1; i >= 0; i--)
+						yield return _steps[i];
+				}
+				else
+				{
+					for (int i = 0; i < _steps.Count; i++)
+						yield return _steps[i];
+				}
+			}
+		}
+
+		/// <summary>
+		/// Gets the nth step along the path, where 0 is the step AFTER the starting point.
+		/// </summary>
+		/// <param name="stepNum">The (array-like index) of the step to get.</param>
+		/// <returns>The coordinate consituting the step specified.</returns>
+		public Coord GetStep(int stepNum)
+		{
+			if (inOriginalOrder)
+				return _steps[(_steps.Count - 2) - stepNum];
+
+			return _steps[stepNum + 1];
+		}
+
+		/// <summary>
+		/// Gets the nth step along the path, where 0 IS the starting point.
+		/// </summary>
+		/// <param name="stepNum">The (array-like index) of the step to get.</param>
+		/// <returns>The coordinate consituting the step specified.</returns>
+		public Coord GetStepWithStart(int stepNum)
+		{
+			if (inOriginalOrder)
+				return _steps[(_steps.Count - 1) - stepNum];
+
+			return _steps[stepNum];
+		}
+
+		/// <summary>
+		/// Reverses the path, in constant time.
+		/// </summary>
+		public void Reverse() => inOriginalOrder = !inOriginalOrder;
+
+		/// <summary>
+		/// Returns a string representation of all the steps in the path, including the start point,
+		/// eg. [(1, 2), (3, 4), (5, 6)].
+		/// </summary>
+		/// <returns>A string representation of all steps in the path, including the start.</returns>
+		public override string ToString() => StepsWithStart.ExtendToString();
+	}
+
+	// Node representing a grid position in AStar's priority queue
+	internal class AStarNode : FastPriorityQueueNode
+	{
+		public readonly Coord Position;
+
+		// Whether or not the node has been closed
+		public float F;
+
+		// (Partly estimated) distance to end point going thru this node
+		public float G;
+
+		public AStarNode Parent;
+		// (Known) distance from start to this node, by shortest known path
+
+		public AStarNode(Coord position, AStarNode parent = null)
+		{
+			Parent = parent;
+			Position = position;
+			F = G = float.MaxValue;
+		}
+	}
 }
